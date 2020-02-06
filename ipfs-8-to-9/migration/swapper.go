@@ -11,20 +11,26 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
 	dshelp "github.com/ipfs/go-ipfs-ds-help"
-	"github.com/multiformats/go-multihash"
 )
 
-// SyncSize specifies how much we batch data before committing and syncing
-// Increasing this number may result
-var SyncSize uint64 = 10 * 1024 * 1024 // 1MiB
+// SyncSize specifies how much we batch data before committing and syncing.
+var SyncSize uint64 = 10 * 1024 * 1024 // 10MiB
 
-// NWorkers sets the number of batching threads to run
+// NWorkers sets the number of swapping threads to run.
 var NWorkers int = 4
+
+// Swap holds the datastore keys for the original CID and for the
+// destination Multihash.
+type Swap struct {
+	Old ds.Key
+	New ds.Key
+}
 
 // CidSwapper reads all the keys in a datastore and replaces
 // them with their raw multihash.
 type CidSwapper struct {
-	Store ds.Batching // the datastore to migrate.
+	Store  ds.Batching // the datastore to migrate.
+	SwapCh chan Swap   // a channel that gets notified for every swap
 }
 
 // Run lists all the keys in the datastore and triggers a swap operation for
@@ -67,13 +73,40 @@ func (cswap *CidSwapper) Run() (uint64, error) {
 	return total, nil
 }
 
+// Revert allows to undo any operations made by Run(). The given channel should
+// receive Swap objects as they were sent by Run. It returns the number of
+// swap operations performed.
+func (cswap *CidSwapper) Revert(unswapCh <-chan Swap) (uint64, error) {
+	var total uint64
+	var nErrors uint64
+	var wg sync.WaitGroup
+	wg.Add(NWorkers)
+	for i := 0; i < NWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			n, e := cswap.unswapWorker(unswapCh)
+			atomic.AddUint64(&total, n)
+			atomic.AddUint64(&nErrors, e)
+		}()
+	}
+	wg.Wait()
+	if nErrors > 0 {
+		return total, errors.New("errors happened during the revert migration. Consider running it again")
+	}
+
+	return total, nil
+}
+
 // swapWorkers reads query results from a channel and renames CIDv1 keys to
 // raw multihashes by reading the blocks and storing them with the new
 // key. Returns the number of keys swapped and the number of errors.
 func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint64) {
-	var swapped uint64
 	var errored uint64
-	var curSyncSize uint64
+
+	sw := &swapWorker{
+		store:  cswap.Store,
+		swapCh: cswap.SwapCh,
+	}
 
 	// Process keys from the results channel
 	for res := range resultsCh {
@@ -96,55 +129,128 @@ func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint
 		}
 
 		// Cid Version > 0
-		newKey := multihashToDsKey(c.Hash())
-		size, err := cswap.swap(oldKey, newKey)
+		mh := c.Hash()
+		newKey := dshelp.MultihashToDsKey(mh)
+		err = sw.swap(oldKey, newKey)
 		if err != nil {
 			log.Error("swapping %s for %s: %s", oldKey, newKey, err)
 			errored++
 			continue
 		}
-		swapped++
-		curSyncSize += size
-
-		// Commit and Sync if we reached SyncSize
-		if curSyncSize >= SyncSize {
-			curSyncSize = 0
-			err = cswap.Store.Sync(ds.NewKey("/"))
-			if err != nil {
-				log.Error(err)
-				errored++
-				continue
-			}
-		}
 	}
-	return swapped, errored
+
+	// final sync
+	err := sw.sync()
+	if err != nil {
+		log.Error("error performing last sync: %s", err)
+		errored++
+	}
+
+	return sw.swapped, errored
 }
 
-// swap swaps the old for the new key in a single transaction.
-func (cswap *CidSwapper) swap(old, new ds.Key) (uint64, error) {
-	// Unfortunately grouping multiple swaps in larger batches usually
-	// results in "too many open files" errors in flatfs (many really
-	// small files) . So we do small batches instead and Sync at larger
-	// intervals.
-	// Note flatfs will not clear up the batch after committing, so
-	// the object cannot be-reused.
-	batcher, err := cswap.Store.Batch()
-	if err != nil {
-		return 0, err
+// unswap worker takes notifications from unswapCh (as they would be sent by
+// the swapWorker) and undoes them. It ignores NotFound errors so that reverts
+// can succeed even if they failed half-way.
+func (cswap *CidSwapper) unswapWorker(unswapCh <-chan Swap) (uint64, uint64) {
+	var errored uint64
+
+	swker := &swapWorker{
+		store:  cswap.Store,
+		swapCh: cswap.SwapCh,
 	}
 
-	v, err := cswap.Store.Get(old)
+	// Process keys from the results channel
+	for sw := range unswapCh {
+		err := swker.swap(sw.New, sw.Old)
+		if err == ds.ErrNotFound {
+			log.Log("could not revert %s->%s. Was it already reverted? Ignoring...", sw.Old, sw.New)
+			continue
+		}
+		if err != nil {
+			log.Error("swapping %s for %s: %s", sw.New, sw.Old, err)
+			errored++
+			continue
+		}
+	}
+
+	// final sync
+	err := swker.sync()
+	if err != nil {
+		log.Error("error performing last sync: %s", err)
+		errored++
+	}
+
+	return swker.swapped, errored
+}
+
+// swapWorker swaps old keys for new keys, syncing to disk regularly
+// and notifying swapCh of the changes.
+type swapWorker struct {
+	swapped     uint64
+	curSyncSize uint64
+
+	swapCh chan Swap
+	store  ds.Batching
+
+	toDelete []ds.Key
+}
+
+// swap replaces old keys with new ones. It Syncs() when the
+// number of items written reaches SyncSize. Upon that it proceeds
+// to delete the old items.
+func (sw *swapWorker) swap(old, new ds.Key) error {
+	v, err := sw.store.Get(old)
 	vLen := uint64(len(v))
 	if err != nil {
-		return vLen, err
+		return err
 	}
-	if err := batcher.Put(new, v); err != nil {
-		return vLen, err
+	if err := sw.store.Put(new, v); err != nil {
+		return err
 	}
-	if err := batcher.Delete(old); err != nil {
-		return vLen, err
+	sw.toDelete = append(sw.toDelete, old)
+
+	sw.swapped++
+	sw.curSyncSize += vLen
+
+	if sw.swapCh != nil {
+		sw.swapCh <- Swap{Old: old, New: new}
 	}
-	return vLen, batcher.Commit()
+
+	// We have copied about 10MB
+	if sw.curSyncSize >= SyncSize {
+		sw.curSyncSize = 0
+		err = sw.sync()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (sw *swapWorker) sync() error {
+	// Sync all the new keys to disk
+	err := sw.store.Sync(ds.NewKey("/"))
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+
+	// Delete all the old keys
+	for _, o := range sw.toDelete {
+		if err := sw.store.Delete(o); err != nil {
+			return err
+		}
+	}
+	sw.toDelete = nil
+
+	// Sync again.
+	err = sw.store.Sync(ds.NewKey("/"))
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+	return nil
 }
 
 // Copied from go-ipfs-ds-help as that one is gone.
@@ -154,12 +260,4 @@ func dsKeyToCid(dsKey datastore.Key) (cid.Cid, error) {
 		return cid.Cid{}, err
 	}
 	return cid.Cast(kb)
-}
-
-// multihashToDsKey creates a Key from the given Multihash.
-// here to avoid dependency on newer dshelp function.
-// TODO: can be removed if https://github.com/ipfs/go-ipfs-ds-help/pull/18
-// is merged.
-func multihashToDsKey(k multihash.Multihash) datastore.Key {
-	return dshelp.NewKeyFromBinary(k)
 }
