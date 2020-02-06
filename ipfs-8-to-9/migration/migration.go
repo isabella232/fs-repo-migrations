@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	migrate "github.com/ipfs/fs-repo-migrations/go-migrate"
 	lock "github.com/ipfs/fs-repo-migrations/ipfs-1-to-2/repolock"
@@ -125,15 +124,15 @@ func (m Migration) Apply(opts migrate.Options) error {
 	buf := bufio.NewWriter(f)
 	defer buf.Flush()
 
+	// Will be closed by cidSwapper when it finish writing.
 	swapCh := make(chan Swap, 1000)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	writingDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
 		for sw := range swapCh {
 			fmt.Fprint(buf, sw.Old.String()+","+sw.New.String()+"\n")
 		}
+		close(writingDone)
 	}()
 
 	cidSwapper := CidSwapper{Store: blocks, SwapCh: swapCh}
@@ -142,8 +141,9 @@ func (m Migration) Apply(opts migrate.Options) error {
 		log.Error(err)
 		return err
 	}
-	close(swapCh)
-	wg.Wait()
+	// Wait for our writing to finish before doing the final flush
+	// (deferred).
+	<-writingDone
 
 	log.Log("%d CIDv1 keys swapped to raw multihashes", total)
 	if err := repo.WriteVersion("9"); err != nil {
@@ -192,11 +192,8 @@ func (m Migration) Revert(opts migrate.Options) error {
 
 	unswapCh := make(chan Swap, 1000)
 	scanner := bufio.NewScanner(f)
-	var wg sync.WaitGroup
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		defer close(unswapCh)
 
 		for scanner.Scan() {
@@ -222,7 +219,6 @@ func (m Migration) Revert(opts migrate.Options) error {
 		log.Error(err)
 		return err
 	}
-	wg.Wait()
 
 	log.Log("%d multihashes reverted to CidV1s", total)
 	if err := repo.WriteVersion("8"); err != nil {
@@ -231,7 +227,11 @@ func (m Migration) Revert(opts migrate.Options) error {
 	}
 
 	log.Log("reverted version file to version 8")
-	f.Close()
+	err = f.Close()
+	if err != nil {
+		log.Error("could not close backup file")
+		return err
+	}
 	err = os.Remove(backupPath)
 	if err != nil {
 		log.Error("could not remove the backup file, but migration worked: %s", err)

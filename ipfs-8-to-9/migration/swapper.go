@@ -37,9 +37,11 @@ type CidSwapper struct {
 // those corresponding to CIDv1s (replacing them by their raw multihash).
 //
 // Run returns the total number of keys swapped.
+// The SwapCh is closed at the end of the run.
 func (cswap *CidSwapper) Run() (uint64, error) {
-	// Always perform a final sync
-	defer cswap.Store.Sync(ds.NewKey("/"))
+	if cswap.SwapCh != nil {
+		defer close(cswap.SwapCh)
+	}
 	// Query all keys. We will loop all keys
 	// and swap those that can be parsed as CIDv1.
 	queryAll := query.Query{
