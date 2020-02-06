@@ -33,11 +33,9 @@ func (m Migration) Versions() string {
 	return "8-to-9"
 }
 
-// Reversible returns false. This migration cannot be reverted, as we do not
-// know which raw hashes were actually CIDv1s. However, things should work all
-// the same as they will be treated as CIDv0s in old versions anyways.
+// Reversible returns true.
 func (m Migration) Reversible() bool {
-	return false
+	return true
 }
 
 // lock the repo
