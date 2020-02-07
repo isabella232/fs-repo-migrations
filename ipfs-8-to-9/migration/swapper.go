@@ -14,9 +14,10 @@ import (
 )
 
 // SyncSize specifies how much we batch data before committing and syncing.
-var SyncSize uint64 = 10 * 1024 * 1024 // 10MiB
+var SyncSize uint64 = 20 * 1024 * 1024 // 20MiB
 
-// NWorkers sets the number of swapping threads to run.
+// NWorkers sets the number of swapping threads to run when applying a
+// migration.
 var NWorkers int = 4
 
 // Swap holds the datastore keys for the original CID and for the
@@ -260,6 +261,7 @@ func (sw *swapWorker) swap(old, new ds.Key) error {
 }
 
 func (sw *swapWorker) sync() error {
+	log.Log("Syncing after %d objects migrated", sw.swapped)
 	// Sync all the new keys to disk
 	err := sw.store.Sync(sw.syncPrefix)
 	if err != nil {
