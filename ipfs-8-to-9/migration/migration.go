@@ -9,12 +9,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	migrate "github.com/ipfs/fs-repo-migrations/go-migrate"
 	lock "github.com/ipfs/fs-repo-migrations/ipfs-1-to-2/repolock"
 	"github.com/ipfs/fs-repo-migrations/mfsr"
 	"github.com/ipfs/go-filestore"
+	dshelp "github.com/ipfs/go-ipfs-ds-help"
 
 	log "github.com/ipfs/fs-repo-migrations/stump"
 	ds "github.com/ipfs/go-datastore"
@@ -124,34 +124,47 @@ func (m Migration) Apply(opts migrate.Options) error {
 	}
 	defer f.Close()
 	buf := bufio.NewWriter(f)
-	defer buf.Flush()
 
-	// Will be closed by cidSwapper when it finish writing.
 	swapCh := make(chan Swap, 1000)
 
 	writingDone := make(chan struct{})
 	go func() {
 		for sw := range swapCh {
-			fmt.Fprint(buf, sw.Old.String()+","+sw.New.String()+"\n")
+			// Only write the Old string (a CID). We can derive
+			// the multihash from it.
+			fmt.Fprint(buf, sw.Old.String(), "\n")
 		}
 		close(writingDone)
 	}()
 
+	// Add all the keys to migrate to the backup file
 	for _, prefix := range migrationPrefixes {
-		log.VLog("  - migrating keys for prefix %s", prefix)
+		log.VLog("  - Adding keys in prefix %s to backup file", prefix)
 		cidSwapper := CidSwapper{Prefix: prefix, Store: dstore, SwapCh: swapCh}
-		total, err := cidSwapper.Run()
+		total, err := cidSwapper.Run(true) // DRY RUN
 		if err != nil {
 			close(swapCh)
 			log.Error(err)
 			return err
 		}
-		log.Log("%d CIDv1 keys swapped to raw multihashes for %s", total, prefix)
+		log.Log("%d CIDv1 keys added to backup file for %s", total, prefix)
 	}
 	close(swapCh)
-	// Wait for our writing to finish before doing the final flush
-	// (deferred).
+	// Wait for our writing to finish before doing the flushing.
 	<-writingDone
+	buf.Flush()
+
+	// The backup file is ready. Run the migration.
+	for _, prefix := range migrationPrefixes {
+		log.VLog("  - Migrating keys in prefix %s", prefix)
+		cidSwapper := CidSwapper{Prefix: prefix, Store: dstore}
+		total, err := cidSwapper.Run(false) // NOT a Dry Run
+		if err != nil {
+			log.Error(err)
+			return err
+		}
+		log.Log("%d CIDv1 keys in %s have been migrated", total, prefix)
+	}
 
 	if err := repo.WriteVersion("9"); err != nil {
 		log.Error("failed to write version file")
@@ -198,18 +211,26 @@ func (m Migration) Revert(opts migrate.Options) error {
 
 	unswapCh := make(chan Swap, 1000)
 	scanner := bufio.NewScanner(f)
+	var scannerErr error
 
 	go func() {
 		defer close(unswapCh)
 
 		for scanner.Scan() {
-			line := scanner.Text()
-			oldAndNew := strings.Split(line, ",")
-			if len(oldAndNew) != 2 {
-				log.Error("bad line in backup file: %s", line)
-				continue
+			cidPath := ds.NewKey(scanner.Text())
+			cidKey := ds.NewKey(cidPath.BaseNamespace())
+			prefix := cidPath.Parent()
+			cid, err := dsKeyToCid(cidKey)
+			if err != nil {
+				log.Error("could not parse cid from backup file: %s", err)
+				scannerErr = err
+				break
 			}
-			sw := Swap{Old: ds.NewKey(oldAndNew[0]), New: ds.NewKey(oldAndNew[1])}
+			mhashPath := prefix.Child(dshelp.MultihashToDsKey(cid.Hash()))
+			// This is the original swap object which is what we
+			// wanted to rebuild. Old is the old path and new is
+			// the new path and the unswapper will revert this.
+			sw := Swap{Old: cidPath, New: mhashPath}
 			unswapCh <- sw
 		}
 		if err := scanner.Err(); err != nil {
@@ -219,11 +240,17 @@ func (m Migration) Revert(opts migrate.Options) error {
 
 	}()
 
-	// The backup file contains prefixed keys, so we do not need to set them.
+	// The backup file contains prefixed keys, so we do not need to set
+	// them.
 	cidSwapper := CidSwapper{Store: dstore}
 	total, err := cidSwapper.Revert(unswapCh)
 	if err != nil {
 		log.Error(err)
+		return err
+	}
+	// Revert will only return after unswapCh is closed, so we know
+	// scannerErr is safe to read at this point.
+	if scannerErr != nil {
 		return err
 	}
 

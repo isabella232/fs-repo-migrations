@@ -37,10 +37,11 @@ type CidSwapper struct {
 
 // Run lists all the keys in the datastore and triggers a swap operation for
 // those corresponding to CIDv1s (replacing them by their raw multihash).
+// When dryRun is true, it will not perform any changes, but notify SwapCh
+// as if it would.
 //
 // Run returns the total number of keys swapped.
-// The SwapCh is closed at the end of the run.
-func (cswap *CidSwapper) Run() (uint64, error) {
+func (cswap *CidSwapper) Run(dryRun bool) (uint64, error) {
 	// Query all keys. We will loop all keys
 	// and swap those that can be parsed as CIDv1.
 	queryAll := query.Query{
@@ -55,7 +56,7 @@ func (cswap *CidSwapper) Run() (uint64, error) {
 	defer results.Close()
 	resultsCh := results.Next()
 	swapWorkerFunc := func() (uint64, uint64) {
-		return cswap.swapWorker(resultsCh)
+		return cswap.swapWorker(dryRun, resultsCh)
 	}
 	return cswap.runWorkers(NWorkers, swapWorkerFunc)
 }
@@ -100,12 +101,11 @@ func (cswap *CidSwapper) runWorkers(nWorkers int, f func() (uint64, uint64)) (ui
 // swapWorkers reads query results from a channel and renames CIDv1 keys to
 // raw multihashes by reading the blocks and storing them with the new
 // key. Returns the number of keys swapped and the number of errors.
-func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint64) {
+func (cswap *CidSwapper) swapWorker(dryRun bool, resultsCh <-chan query.Result) (uint64, uint64) {
 	var errored uint64
 
 	sw := &swapWorker{
 		store:      cswap.Store,
-		swapCh:     cswap.SwapCh,
 		syncPrefix: cswap.Prefix,
 	}
 
@@ -133,19 +133,34 @@ func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint
 		mh := c.Hash()
 		// /path/to/old/<cid> -> /path/to/old/<multihash>
 		newKey := oldKey.Parent().Child(dshelp.MultihashToDsKey(mh))
-		err = sw.swap(oldKey, newKey)
-		if err != nil {
-			log.Error("swapping %s for %s: %s", oldKey, newKey, err)
-			errored++
-			continue
+		if dryRun {
+			sw.swapped++
+		} else {
+			err = sw.swap(oldKey, newKey)
+			if err != nil {
+				log.Error("swapping %s for %s: %s", oldKey, newKey, err)
+				errored++
+				continue
+			}
+		}
+
+		if cswap.SwapCh != nil {
+			cswap.SwapCh <- Swap{Old: oldKey, New: newKey}
 		}
 	}
 
-	// final sync
-	err := sw.sync()
-	if err != nil {
-		log.Error("error performing last sync: %s", err)
-		errored++
+	if !dryRun {
+		// final sync
+		err := sw.syncAndDelete()
+		if err != nil {
+			log.Error("error performing last sync: %s", err)
+			errored++
+		}
+		err = sw.sync() // sync deleted items
+		if err != nil {
+			log.Error("error performing last sync for deletions: %s", err)
+			errored++
+		}
 	}
 
 	return sw.swapped, errored
@@ -159,7 +174,6 @@ func (cswap *CidSwapper) unswapWorker(unswapCh <-chan Swap) (uint64, uint64) {
 
 	swker := &swapWorker{
 		store:      cswap.Store,
-		swapCh:     cswap.SwapCh,
 		syncPrefix: cswap.Prefix,
 	}
 
@@ -194,21 +208,27 @@ func (cswap *CidSwapper) unswapWorker(unswapCh <-chan Swap) (uint64, uint64) {
 				errored++
 			}
 			swker.swapped++
-			continue
-		}
-		if err != nil {
+		} else if err != nil {
 			log.Error("swapping %s for %s: %s", sw.New, sw.Old, err)
 			errored++
 			continue
+		}
+		if cswap.SwapCh != nil {
+			cswap.SwapCh <- Swap{Old: sw.New, New: sw.Old}
 		}
 		// Remember that we switched certain multiash for a Cid already
 		unswappedMap[sw.New] = sw.Old
 	}
 
-	// final sync
-	err := swker.sync()
+	// final sync to added things
+	err := swker.syncAndDelete()
 	if err != nil {
 		log.Error("error performing last sync: %s", err)
+		errored++
+	}
+	err = swker.sync() // final sync for deletes.
+	if err != nil {
+		log.Error("error performing last sync for deletions: %s", err)
 		errored++
 	}
 
@@ -221,7 +241,6 @@ type swapWorker struct {
 	swapped     uint64
 	curSyncSize uint64
 
-	swapCh     chan Swap
 	store      ds.Batching
 	syncPrefix ds.Key
 
@@ -245,14 +264,10 @@ func (sw *swapWorker) swap(old, new ds.Key) error {
 	sw.swapped++
 	sw.curSyncSize += vLen
 
-	if sw.swapCh != nil {
-		sw.swapCh <- Swap{Old: old, New: new}
-	}
-
 	// We have copied about 10MB
 	if sw.curSyncSize >= SyncSize {
 		sw.curSyncSize = 0
-		err = sw.sync()
+		err = sw.syncAndDelete()
 		if err != nil {
 			return err
 		}
@@ -260,12 +275,9 @@ func (sw *swapWorker) swap(old, new ds.Key) error {
 	return nil
 }
 
-func (sw *swapWorker) sync() error {
-	log.Log("Syncing after %d objects migrated", sw.swapped)
-	// Sync all the new keys to disk
-	err := sw.store.Sync(sw.syncPrefix)
+func (sw *swapWorker) syncAndDelete() error {
+	err := sw.sync()
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 
@@ -276,11 +288,13 @@ func (sw *swapWorker) sync() error {
 		}
 	}
 	sw.toDelete = nil
+	return nil
+}
 
-	// Sync again.
-	err = sw.store.Sync(sw.syncPrefix)
+func (sw *swapWorker) sync() error {
+	log.Log("Migration worker syncing after %d objects migrated", sw.swapped)
+	err := sw.store.Sync(sw.syncPrefix)
 	if err != nil {
-		log.Error(err)
 		return err
 	}
 	return nil
