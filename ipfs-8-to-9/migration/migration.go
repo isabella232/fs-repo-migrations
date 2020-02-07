@@ -14,7 +14,7 @@ import (
 	migrate "github.com/ipfs/fs-repo-migrations/go-migrate"
 	lock "github.com/ipfs/fs-repo-migrations/ipfs-1-to-2/repolock"
 	"github.com/ipfs/fs-repo-migrations/mfsr"
-	"github.com/ipfs/go-datastore/namespace"
+	"github.com/ipfs/go-filestore"
 
 	log "github.com/ipfs/fs-repo-migrations/stump"
 	ds "github.com/ipfs/go-datastore"
@@ -23,6 +23,11 @@ import (
 )
 
 const backupFile = "8-to-9-cids.txt"
+
+var migrationPrefixes = []ds.Key{
+	ds.NewKey("blocks"),
+	filestore.FilestorePrefix,
+}
 
 // Migration implements the migration described above.
 type Migration struct{}
@@ -96,9 +101,6 @@ func (m Migration) Apply(opts migrate.Options) error {
 	}
 	defer dstore.Close()
 
-	// Assuming the user has not modified the blocks namespace
-	blocks := namespace.Wrap(dstore, ds.NewKey("/blocks"))
-
 	log.VLog("  - starting CIDv1 to raw multihash block migration")
 
 	// Prepare backing up of CIDs
@@ -135,17 +137,22 @@ func (m Migration) Apply(opts migrate.Options) error {
 		close(writingDone)
 	}()
 
-	cidSwapper := CidSwapper{Store: blocks, SwapCh: swapCh}
-	total, err := cidSwapper.Run()
-	if err != nil {
-		log.Error(err)
-		return err
+	for _, prefix := range migrationPrefixes {
+		log.VLog("  - migrating keys for prefix %s", prefix)
+		cidSwapper := CidSwapper{Prefix: prefix, Store: dstore, SwapCh: swapCh}
+		total, err := cidSwapper.Run()
+		if err != nil {
+			close(swapCh)
+			log.Error(err)
+			return err
+		}
+		log.Log("%d CIDv1 keys swapped to raw multihashes for %s", total, prefix)
 	}
+	close(swapCh)
 	// Wait for our writing to finish before doing the final flush
 	// (deferred).
 	<-writingDone
 
-	log.Log("%d CIDv1 keys swapped to raw multihashes", total)
 	if err := repo.WriteVersion("9"); err != nil {
 		log.Error("failed to write version file")
 		return err
@@ -179,7 +186,6 @@ func (m Migration) Revert(opts migrate.Options) error {
 		return err
 	}
 	defer dstore.Close()
-	blocks := namespace.Wrap(dstore, ds.NewKey("/blocks"))
 
 	// Open revert path for reading
 	backupPath := filepath.Join(opts.Path, backupFile)
@@ -213,7 +219,8 @@ func (m Migration) Revert(opts migrate.Options) error {
 
 	}()
 
-	cidSwapper := CidSwapper{Store: blocks}
+	// The backup file contains prefixed keys, so we do not need to set them.
+	cidSwapper := CidSwapper{Store: dstore}
 	total, err := cidSwapper.Revert(unswapCh)
 	if err != nil {
 		log.Error(err)
@@ -232,9 +239,10 @@ func (m Migration) Revert(opts migrate.Options) error {
 		log.Error("could not close backup file")
 		return err
 	}
-	err = os.Remove(backupPath)
+	err = os.Rename(backupPath, backupPath+".reverted")
 	if err != nil {
-		log.Error("could not remove the backup file, but migration worked: %s", err)
+		log.Error("could not rename the backup file, but migration worked: %s", err)
+		return err
 	}
 	return nil
 }

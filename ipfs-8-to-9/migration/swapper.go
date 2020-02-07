@@ -29,6 +29,7 @@ type Swap struct {
 // CidSwapper reads all the keys in a datastore and replaces
 // them with their raw multihash.
 type CidSwapper struct {
+	Prefix ds.Key      // A prefix/namespace to limit the query.
 	Store  ds.Batching // the datastore to migrate.
 	SwapCh chan Swap   // a channel that gets notified for every swap
 }
@@ -39,12 +40,10 @@ type CidSwapper struct {
 // Run returns the total number of keys swapped.
 // The SwapCh is closed at the end of the run.
 func (cswap *CidSwapper) Run() (uint64, error) {
-	if cswap.SwapCh != nil {
-		defer close(cswap.SwapCh)
-	}
 	// Query all keys. We will loop all keys
 	// and swap those that can be parsed as CIDv1.
 	queryAll := query.Query{
+		Prefix:   cswap.Prefix.String(),
 		KeysOnly: true,
 	}
 
@@ -54,15 +53,38 @@ func (cswap *CidSwapper) Run() (uint64, error) {
 	}
 	defer results.Close()
 	resultsCh := results.Next()
+	swapWorkerFunc := func() (uint64, uint64) {
+		return cswap.swapWorker(resultsCh)
+	}
+	return cswap.runWorkers(NWorkers, swapWorkerFunc)
+}
 
+// Revert allows to undo any operations made by Run(). The given channel should
+// receive Swap objects as they were sent by Run. It returns the number of
+// swap operations performed.
+func (cswap *CidSwapper) Revert(unswapCh <-chan Swap) (uint64, error) {
+	swapWorkerFunc := func() (uint64, uint64) {
+		return cswap.unswapWorker(unswapCh)
+	}
+	// We only run 1 worker for revert. Migrations
+	// many-cid-to-one-multihash mappings, but reverts can have the
+	// opposite. The unswapWorker keeps a cache to handle that, but
+	// this only works with a single worker. Otherwise we'd need
+	// complex syncing, or delayed removal (increased datastore size).
+	return cswap.runWorkers(1, swapWorkerFunc)
+}
+
+// Run workers launches several workers to run the given function which returns
+// number of swapped items and number of errors.
+func (cswap *CidSwapper) runWorkers(nWorkers int, f func() (uint64, uint64)) (uint64, error) {
 	var total uint64
 	var nErrors uint64
 	var wg sync.WaitGroup
-	wg.Add(NWorkers)
-	for i := 0; i < NWorkers; i++ {
+	wg.Add(nWorkers)
+	for i := 0; i < nWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			n, e := cswap.swapWorker(resultsCh)
+			n, e := f()
 			atomic.AddUint64(&total, n)
 			atomic.AddUint64(&nErrors, e)
 		}()
@@ -71,31 +93,6 @@ func (cswap *CidSwapper) Run() (uint64, error) {
 	if nErrors > 0 {
 		return total, errors.New("errors happened during the migration. Consider running it again")
 	}
-
-	return total, nil
-}
-
-// Revert allows to undo any operations made by Run(). The given channel should
-// receive Swap objects as they were sent by Run. It returns the number of
-// swap operations performed.
-func (cswap *CidSwapper) Revert(unswapCh <-chan Swap) (uint64, error) {
-	var total uint64
-	var nErrors uint64
-	var wg sync.WaitGroup
-	wg.Add(NWorkers)
-	for i := 0; i < NWorkers; i++ {
-		go func() {
-			defer wg.Done()
-			n, e := cswap.unswapWorker(unswapCh)
-			atomic.AddUint64(&total, n)
-			atomic.AddUint64(&nErrors, e)
-		}()
-	}
-	wg.Wait()
-	if nErrors > 0 {
-		return total, errors.New("errors happened during the revert migration. Consider running it again")
-	}
-
 	return total, nil
 }
 
@@ -106,8 +103,9 @@ func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint
 	var errored uint64
 
 	sw := &swapWorker{
-		store:  cswap.Store,
-		swapCh: cswap.SwapCh,
+		store:      cswap.Store,
+		swapCh:     cswap.SwapCh,
+		syncPrefix: cswap.Prefix,
 	}
 
 	// Process keys from the results channel
@@ -119,7 +117,7 @@ func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint
 		}
 
 		oldKey := ds.NewKey(res.Key)
-		c, err := dsKeyToCid(oldKey)
+		c, err := dsKeyToCid(ds.NewKey(oldKey.BaseNamespace())) // remove prefix
 		if err != nil {
 			// complain if we find anything that is not a CID but
 			// leave it as it is.
@@ -132,7 +130,8 @@ func (cswap *CidSwapper) swapWorker(resultsCh <-chan query.Result) (uint64, uint
 
 		// Cid Version > 0
 		mh := c.Hash()
-		newKey := dshelp.MultihashToDsKey(mh)
+		// /path/to/old/<cid> -> /path/to/old/<multihash>
+		newKey := oldKey.Parent().Child(dshelp.MultihashToDsKey(mh))
 		err = sw.swap(oldKey, newKey)
 		if err != nil {
 			log.Error("swapping %s for %s: %s", oldKey, newKey, err)
@@ -158,15 +157,42 @@ func (cswap *CidSwapper) unswapWorker(unswapCh <-chan Swap) (uint64, uint64) {
 	var errored uint64
 
 	swker := &swapWorker{
-		store:  cswap.Store,
-		swapCh: cswap.SwapCh,
+		store:      cswap.Store,
+		swapCh:     cswap.SwapCh,
+		syncPrefix: cswap.Prefix,
 	}
+
+	// A map from multihash to Cid
+	unswappedMap := make(map[ds.Key]ds.Key)
 
 	// Process keys from the results channel
 	for sw := range unswapCh {
 		err := swker.swap(sw.New, sw.Old)
+
+		// Handle the case where a block had actually multiple CIDs
+		// and we already deleted the multihash-addressed block.  This
+		// needs a manual swap from the CID we reverted to before.
 		if err == ds.ErrNotFound {
-			log.Log("could not revert %s->%s. Was it already reverted? Ignoring...", sw.Old, sw.New)
+			// Is it because we swapped it already?
+			swappedTo, ok := unswappedMap[sw.New]
+			if !ok {
+				log.Error("could not revert %s->%s. Could not find %s", sw.Old, sw.New, sw.New)
+				errored++
+				continue
+			}
+			swker.sync()
+			log.VLog("  - %s is duplicated under additional CIDs (%s). This is ok.", sw.New, sw.Old)
+			v, err := swker.store.Get(swappedTo)
+			if err != nil {
+				log.Error("could not get previously reverted value %s: %s", swappedTo, err)
+				errored++
+				continue
+			}
+			if err := swker.store.Put(sw.Old, v); err != nil {
+				log.Error(err)
+				errored++
+			}
+			swker.swapped++
 			continue
 		}
 		if err != nil {
@@ -174,6 +200,8 @@ func (cswap *CidSwapper) unswapWorker(unswapCh <-chan Swap) (uint64, uint64) {
 			errored++
 			continue
 		}
+		// Remember that we switched certain multiash for a Cid already
+		unswappedMap[sw.New] = sw.Old
 	}
 
 	// final sync
@@ -192,8 +220,9 @@ type swapWorker struct {
 	swapped     uint64
 	curSyncSize uint64
 
-	swapCh chan Swap
-	store  ds.Batching
+	swapCh     chan Swap
+	store      ds.Batching
+	syncPrefix ds.Key
 
 	toDelete []ds.Key
 }
@@ -232,7 +261,7 @@ func (sw *swapWorker) swap(old, new ds.Key) error {
 
 func (sw *swapWorker) sync() error {
 	// Sync all the new keys to disk
-	err := sw.store.Sync(ds.NewKey("/"))
+	err := sw.store.Sync(sw.syncPrefix)
 	if err != nil {
 		log.Error(err)
 		return err
@@ -247,7 +276,7 @@ func (sw *swapWorker) sync() error {
 	sw.toDelete = nil
 
 	// Sync again.
-	err = sw.store.Sync(ds.NewKey("/"))
+	err = sw.store.Sync(sw.syncPrefix)
 	if err != nil {
 		log.Error(err)
 		return err
